@@ -65,3 +65,12 @@ skills:
     description: >-
       Publish and reply on Threads via Meta's Threads API with an
       approval-gated posting queue.
+  - name: copyright-guard
+    path: skills/copyright-guard
+    version: 0.1.0
+    status: current
+    license: MIT
+    description: >-
+      Pre-publish screen for copyright-risk patterns in drafts: long quotes,
+      lyrics, copyrighted Bible translations, unattributed quotes, unlicensed
+      images. Heuristic screen, not legal clearance.

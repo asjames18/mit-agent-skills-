@@ -14,6 +14,7 @@ Open-source, portable workflows for AI agents doing practical work with evidence
 | [`notion`](skills/notion/SKILL.md) | Notion CLI: search, read pages, query databases, append and update content. | 1.0.0 |
 | [`supabase`](skills/supabase/SKILL.md) | Supabase helpers: hosted MCP JSON-RPC client and a read-only production schema dump. | 1.0.0 |
 | [`threads-post`](skills/threads-post/SKILL.md) | Publish and reply on Threads via Meta's Threads API with an approval-gated posting queue. | 1.0.0 |
+| [`copyright-guard`](skills/copyright-guard/SKILL.md) | Pre-publish screen for copyright-risk patterns in drafts: long quotes, lyrics, copyrighted Bible translations, unattributed quotes, unlicensed images. Heuristic screen, not legal clearance. | 0.1.0 |
 
 ## Repository model
 

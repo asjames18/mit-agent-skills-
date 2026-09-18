@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""copyright-scan: heuristic pre-publish copyright screen for text/markdown.
+
+Reads a markdown or text file (or stdin) and flags patterns that commonly
+create copyright exposure for publishers:
+
+  1. Long verbatim quotes (block or inline, over ~90 words)
+  2. Song-lyric patterns (verse/chorus labels, "lyrics" mentions, repeated lines)
+  3. Copyrighted Bible translations near quoted scripture (NIV, ESV, NKJV, ...)
+  4. Block quotes with no nearby attribution
+  5. External images hosted on domains outside the allowlist
+
+Output is a human-readable report (or --json). Exit code is 1 when any FLAG
+finding exists, 0 otherwise. NOTE findings are informational only.
+
+This is a heuristic screen, not legal clearance. It cannot verify the
+provenance of unquoted prose, and fair use is fact-specific. When in doubt,
+leave the material out or ask a lawyer.
+
+Usage:
+  copyright-scan draft.md
+  copyright-scan draft.md --json
+  cat draft.md | copyright-scan -
+  copyright-scan draft.md --allowlist "mysite.com,cdn.mysite.com"
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+QUOTE_WORD_LIMIT = 90          # verbatim quote length that triggers a FLAG
+SCRIPTURE_WORD_LIMIT = 50      # quoted scripture length that triggers a FLAG
+ATTRIBUTION_WINDOW = 3         # lines around a quote to look for attribution
+
+# Bible translations that are under copyright (representative list).
+COPYRIGHTED_TRANSLATIONS = {
+    "NIV", "ESV", "NKJV", "NLT", "NASB", "NASB1995", "CSB", "HCSB",
+    "AMP", "AMPC", "MSG", "TLB", "CEV", "GNT", "NRSV", "NRSVUE", "RSV",
+    "NET", "GW", "ISV", "LEB", "MEV", "NCV", "NIRV", "NLV", "WE",
+}
+# Public-domain translations: fine for extended quotation.
+PUBLIC_DOMAIN_TRANSLATIONS = {"KJV", "AKJV", "WEB", "ASV", "YLT", "BBE", "OEB"}
+
+# Image hosts treated as generally safe (free-license libraries).
+SAFE_IMAGE_HOSTS = {
+    "unsplash.com", "images.unsplash.com",
+    "pexels.com", "images.pexels.com",
+    "pixabay.com", "cdn.pixabay.com",
+    "wikimedia.org", "upload.wikimedia.org",
+    "openverse.org",
+}
+
+ATTRIBUTION_RE = re.compile(
+    r"^\s*(—|--|–)\s*\S|"
+    r"\bby\s+[A-Z][\w .'-]{1,60}$|"
+    r"\(\s*(source|via|from)\s*[:\-]",
+    re.IGNORECASE,
+)
+LYRIC_LABEL_RE = re.compile(
+    r"^\s*(verse|chorus|bridge|hook|pre-chorus|post-chorus|outro|intro)\b\s*\d*\s*[:\-]?",
+    re.IGNORECASE,
+)
+TRANSLATION_RE = re.compile(
+    r"\b(" + "|".join(sorted(COPYRIGHTED_TRANSLATIONS | PUBLIC_DOMAIN_TRANSLATIONS)) + r")\b"
+)
+IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*(https?://[^)\s]+)")
+INLINE_QUOTE_RE = re.compile(r'"([^"]{200,})"')  # long inline quoted spans
+
+
+def word_count(text):
+    return len(re.findall(r"[A-Za-z0-9']+", text))
+
+
+def strip_md(text):
+    text = re.sub(r"^>\s?", "", text)
+    text = re.sub(r"[*_`#]", "", text)
+    return text.strip()
+
+
+class Finding:
+    def __init__(self, severity, line, rule, detail, suggestion):
+        self.severity = severity  # "FLAG" or "NOTE"
+        self.line = line
+        self.rule = rule
+        self.detail = detail
+        self.suggestion = suggestion
+
+    def to_dict(self):
+        return {"severity": self.severity, "line": self.line, "rule": self.rule,
+                "detail": self.detail, "suggestion": self.suggestion}
+
+    def __str__(self):
+        return (f"[{self.severity}] line {self.line} ({self.rule}): {self.detail}\n"
+                f"    -> {self.suggestion}")
+
+
+def scan(lines, allowlist):
+    findings = []
+    n = len(lines)
+
+    def nearby_attribution(idx):
+        lo = max(0, idx - ATTRIBUTION_WINDOW)
+        hi = min(n, idx + ATTRIBUTION_WINDOW + 1)
+        return any(ATTRIBUTION_RE.search(strip_md(lines[i])) for i in range(lo, hi))
+
+    # --- 1 & 4: blockquote groups ---
+    i = 0
+    while i < n:
+        if lines[i].lstrip().startswith(">"):
+            start = i
+            parts = []
+            while i < n and lines[i].lstrip().startswith(">"):
+                parts.append(strip_md(lines[i]))
+                i += 1
+            text = " ".join(parts)
+            words = word_count(text)
+            if words > QUOTE_WORD_LIMIT:
+                findings.append(Finding(
+                    "FLAG", start + 1, "long-quote",
+                    f"Block quote of ~{words} words exceeds the {QUOTE_WORD_LIMIT}-word screening threshold.",
+                    "Trim to a brief excerpt, paraphrase the rest, and attribute the source. Link instead of copying when possible."))
+            if not nearby_attribution(start):
+                findings.append(Finding(
+                    "FLAG", start + 1, "unattributed-quote",
+                    "Quoted passage has no attribution within "
+                    f"{ATTRIBUTION_WINDOW} lines.",
+                    "Add an attribution line (— Name, Source) or remove the quote."))
+        else:
+            i += 1
+
+    # --- 1b: long inline quoted spans ---
+    for idx, line in enumerate(lines):
+        for m in INLINE_QUOTE_RE.finditer(line):
+            words = word_count(m.group(1))
+            if words > QUOTE_WORD_LIMIT:
+                findings.append(Finding(
+                    "FLAG", idx + 1, "long-quote",
+                    f'Inline quoted passage of ~{words} words exceeds the {QUOTE_WORD_LIMIT}-word threshold.',
+                    "Trim to a brief excerpt with attribution, or paraphrase."))
+
+    # --- 2: song-lyric patterns ---
+    for idx, line in enumerate(lines):
+        if LYRIC_LABEL_RE.match(strip_md(line)):
+            findings.append(Finding(
+                "FLAG", idx + 1, "lyrics-pattern",
+                f"Lyric section label detected: {strip_md(line)[:60]!r}.",
+                "Song lyrics are aggressively enforced. Reference the song title only, or keep to a one-line fair-use snippet with attribution."))
+        if re.search(r"\blyrics\b", line, re.IGNORECASE) and ('"' in line or line.lstrip().startswith(">")):
+            findings.append(Finding(
+                "FLAG", idx + 1, "lyrics-pattern",
+                "The word 'lyrics' appears next to quoted text.",
+                "Confirm this is not reproduced song lyrics. When in doubt, remove and reference the title only."))
+    # repeated short lines (3+ identical) often indicate pasted lyrics/poems
+    seen = {}
+    for idx, line in enumerate(lines):
+        s = strip_md(line)
+        if 3 <= len(s) <= 80 and s and not s.startswith(("#", "-", "*", ">")):
+            seen.setdefault(s.lower(), []).append(idx)
+    for s, idxs in seen.items():
+        if len(idxs) >= 3:
+            findings.append(Finding(
+                "NOTE", idxs[0] + 1, "repeated-lines",
+                f"Identical line repeated {len(idxs)} times: {s[:60]!r}.",
+                "If this is a lyric or poem refrain, keep it to a title reference instead."))
+
+    # --- 3: Bible translations ---
+    for idx, line in enumerate(lines):
+        for m in TRANSLATION_RE.finditer(line):
+            tr = m.group(1).upper()
+            if tr in PUBLIC_DOMAIN_TRANSLATIONS:
+                findings.append(Finding(
+                    "NOTE", idx + 1, "translation-pd",
+                    f"Public-domain translation ({tr}) — fine for extended quotation.",
+                    "No action needed."))
+                continue
+            # look for quoted scripture nearby
+            lo = max(0, idx - 10)
+            hi = min(n, idx + 11)
+            longest = 0
+            for j in range(lo, hi):
+                for q in INLINE_QUOTE_RE.finditer(lines[j]):
+                    longest = max(longest, word_count(q.group(1)))
+                if lines[j].lstrip().startswith(">"):
+                    longest = max(longest, word_count(strip_md(lines[j])))
+            if longest > SCRIPTURE_WORD_LIMIT:
+                findings.append(Finding(
+                    "FLAG", idx + 1, "translation-copyrighted",
+                    f"Copyrighted translation ({tr}) near a ~{longest}-word quoted passage.",
+                    f"For passages over ~{SCRIPTURE_WORD_LIMIT} words, quote KJV or WEB (public domain) instead, or trim to a brief {tr} snippet with attribution."))
+            else:
+                findings.append(Finding(
+                    "NOTE", idx + 1, "translation-copyrighted",
+                    f"Copyrighted translation ({tr}) mentioned; nearby quotes are brief.",
+                    "Brief attributed snippets are generally low risk; keep them short."))
+
+    # --- 5: external images ---
+    for idx, line in enumerate(lines):
+        for m in IMAGE_RE.finditer(line):
+            host = urlparse(m.group(1)).netloc.lower()
+            base = ".".join(host.split(".")[-2:])
+            if host in allowlist or base in allowlist or host in SAFE_IMAGE_HOSTS or base in SAFE_IMAGE_HOSTS:
+                continue
+            findings.append(Finding(
+                "FLAG", idx + 1, "external-image",
+                f"Image hotlinked from {host}, not on the allowlist.",
+                "Use an owned, licensed, or AI-generated image instead. Never hotlink images you do not have rights to."))
+
+    return findings
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Heuristic pre-publish copyright screen.")
+    ap.add_argument("path", help="Markdown/text file to scan, or - for stdin")
+    ap.add_argument("--json", action="store_true", help="Emit JSON findings")
+    ap.add_argument("--allowlist", default=os.environ.get("COPYRIGHT_GUARD_ALLOWLIST", ""),
+                    help="Comma-separated image hosts treated as owned/safe (or set COPYRIGHT_GUARD_ALLOWLIST)")
+    args = ap.parse_args()
+
+    if args.path == "-":
+        text = sys.stdin.read()
+        label = "<stdin>"
+    else:
+        with open(args.path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        label = args.path
+
+    allowlist = {h.strip().lower() for h in args.allowlist.split(",") if h.strip()}
+    findings = scan(text.splitlines(), allowlist)
+    flags = [f for f in findings if f.severity == "FLAG"]
+
+    if args.json:
+        print(json.dumps({"file": label, "findings": [f.to_dict() for f in findings],
+                          "result": "REVIEW" if flags else "PASS"}, indent=2))
+    else:
+        print(f"copyright-scan: {label}")
+        if not findings:
+            print("PASS — no risky patterns detected. (Heuristic screen only; not legal clearance.)")
+        for f in findings:
+            print(f)
+        print(f"\nResult: {'REVIEW — ' + str(len(flags)) + ' flag(s) need attention' if flags else 'PASS'} "
+              f"({len(findings)} finding(s) total). Heuristic screen only; not legal clearance.")
+
+    return 1 if flags else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
