@@ -10,6 +10,15 @@ skills:
       Research, evaluate, create platform-native drafts, approve, and learn
       from social content while preserving evidence, privacy, and
       exact-revision authorization.
+  - name: tiered-technical-product-review
+    path: skills/tiered-technical-product-review
+    version: 0.1.0
+    status: current
+    license: MIT
+    description: >-
+      Produce a source-backed adopt, test, defer, or reject brief for a
+      technical product, AI tool, vendor, or implementation option while
+      preserving evidence labels and research-only authority.
   - name: cloudflare
     path: skills/cloudflare
     version: 1.0.0
