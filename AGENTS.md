@@ -26,6 +26,8 @@ This public repository contains portable skills for AI agents. Each skill must b
 
 GitHub is canonical for public skill content. Notion or other knowledge systems may contain published copies for discovery, but those copies should identify the GitHub version or commit and must not silently diverge.
 
+Personalized or sensitive variants belong in a separate private repository. Do not merge private repository history into this public repository. Reimplement a reusable improvement here as a sanitized change and review it as new public content.
+
 ## Validation
 
 Before merging or publishing a skill:

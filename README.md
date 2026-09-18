@@ -6,13 +6,19 @@ Open-source, portable workflows for AI agents doing practical work with evidence
 
 | Skill | Purpose | Version |
 | --- | --- | --- |
-| [`governed-social-content`](skills/governed-social-content/SKILL.md) | Research, evaluate, draft, approve, and learn from social content without treating preparation as permission to publish. | 0.1.0 |
+| [`governed-social-content`](skills/governed-social-content/SKILL.md) | Research, evaluate, create platform-native drafts, approve, and learn from social content without treating preparation as permission to publish. | 0.2.0 |
 
 ## Repository model
 
 - **GitHub is canonical.** Skill instructions, supporting references, versions, and review history live here.
 - **Knowledge systems are discovery layers.** Notion and similar tools may publish agent-facing copies that link back to a tagged version or commit.
-- **Project repositories supply private context.** Brand rules, account configuration, internal evidence, and implementation details do not belong in this public repository.
+- **A separate private skills repository supplies personal context.** Voice profiles, account configuration, private evidence, internal project details, and personalized overlays do not belong in this public repository.
+
+## Public and private repositories
+
+The public repository contains reusable base Skills. A separate private repository may copy or depend on a pinned public version, then add private overlays for a person, organization, brand, account, or project.
+
+Keep the private repository independent rather than using a workflow that can accidentally merge private history into public. Moving an improvement from private to public requires a new sanitized change in the public repository, followed by privacy review, validation, staged-diff inspection, and secret scanning.
 
 ## Using a skill
 

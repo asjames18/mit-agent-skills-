@@ -3,9 +3,10 @@ repository: asjames18/mit-agent-skills-
 skills:
   - name: governed-social-content
     path: skills/governed-social-content
-    version: 0.1.0
+    version: 0.2.0
     status: current
     license: MIT
     description: >-
-      Research, evaluate, draft, approve, and learn from social content while
-      preserving evidence, privacy, and exact-revision authorization.
+      Research, evaluate, create platform-native drafts, approve, and learn
+      from social content while preserving evidence, privacy, and
+      exact-revision authorization.

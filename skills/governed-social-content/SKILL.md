@@ -2,7 +2,7 @@
 name: governed-social-content
 description: Research, evaluate, draft, adapt, review, or learn from social-media content while preserving evidence, privacy, platform fit, and approval boundaries. Use for posts, threads, replies, comments, carousels, article promotion, or profile recommendations; preparing content does not authorize a public action.
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   license: MIT
 ---
 
@@ -13,6 +13,7 @@ Turn real work and verified developments into useful, platform-appropriate socia
 ## Route the task
 
 - For current events, technical claims, statistics, or other factual research, read [references/research-standard.md](references/research-standard.md).
+- Before drafting for X, LinkedIn, Facebook, Instagram, or TikTok, read the relevant sections of [references/platform-playbooks.md](references/platform-playbooks.md) and [references/platform-requirements.md](references/platform-requirements.md). Read the cross-platform section when one idea will be repurposed for multiple channels.
 - For approval, scheduling, publishing, replies, comments, messages, or any account-affecting action, read [references/approval-invariants.md](references/approval-invariants.md).
 - When producing reusable intake, evidence, approval, or learning artifacts, use [references/output-templates.md](references/output-templates.md).
 - If project-specific brand, voice, account, or confidentiality rules are available, read them before drafting. They override stylistic defaults here but cannot weaken authorization or privacy boundaries.
@@ -54,7 +55,11 @@ Never invent metrics, results, customers, credentials, experience, opinions, or 
 
 ### Adapt to the platform
 
-Preserve the underlying fact while adapting the identity, reader, context, tone, structure, length, media, links, and call to action for each platform. Do not blindly copy identical text across channels.
+Preserve the underlying fact while adapting the identity, reader intent, context, hook, structure, length, media, proof placement, audio, accessibility, links, and call to action for each platform. Do not blindly copy identical text across channels or produce one master caption with superficial length changes.
+
+When the user requests multiple platforms, return a distinct native artifact for each one. State the recommended format—such as an X post or thread, LinkedIn post or document carousel, Facebook feed post or reel, Instagram carousel or reel, or TikTok video—and include the media, script, caption, or slide plan that format requires.
+
+Before an item becomes approval-ready, verify the current limits and requirements for the exact publishing surface: native app, web composer, API, scheduler, business suite, or advertising tool. Record the official source and check date. If a limit cannot be verified, mark it unresolved and do not claim the asset is publish-ready.
 
 ### Validate and package
 
