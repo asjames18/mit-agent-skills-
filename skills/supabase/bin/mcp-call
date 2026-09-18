@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Call tools on the hosted Supabase MCP server (Streamable HTTP).
+
+Each invocation opens a fresh MCP session:
+  initialize -> notifications/initialized -> tools/list | tools/call
+and prints the result as JSON.
+
+Usage:
+  mcp-call --params "read_only=true&features=account" tools
+  mcp-call --params "project_ref=REF&read_only=true&features=database" \\
+      call execute_sql --args '{"query": "select version()"}'
+
+The Supabase PAT is attached as an Authorization bearer header via the
+stored custom.supabase credential; the raw key is never visible here.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cred import (
+    add_surrogate_to_request,
+    read_response_body,
+    DynamicCredentialError,
+)
+
+MCP_BASE = "https://mcp.supabase.com/mcp"
+ALLOWED = ("mcp.supabase.com",)
+CREDENTIAL = "custom.supabase"
+PROTOCOL_VERSION = "2025-03-26"
+
+
+def parse_sse(body: bytes):
+    """Extract JSON payloads from a text/event-stream body."""
+    messages = []
+    text = body.decode("utf-8", "replace")
+    for event in text.replace("\r\n", "\n").split("\n\n"):
+        data_lines = [
+            line[5:].strip()
+            for line in event.split("\n")
+            if line.startswith("data:")
+        ]
+        if not data_lines:
+            continue
+        raw = "\n".join(data_lines)
+        if raw == "[DONE]":
+            continue
+        try:
+            messages.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    return messages
+
+
+def mcp_post(url, session_id, payload):
+    """POST one JSON-RPC message; return (session_id, [messages])."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json, text/event-stream")
+    req.add_header("User-Agent", "mit-agent-skills/1.0 (Streamable HTTP client)")
+    if session_id:
+        req.add_header("Mcp-Session-Id", session_id)
+    add_surrogate_to_request(
+        req, CREDENTIAL, entry_name="access_token", allowed_hosts=ALLOWED
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            new_session = resp.headers.get("Mcp-Session-Id") or session_id
+            ctype = resp.headers.get("Content-Type", "")
+            raw = read_response_body(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:2000]
+        except Exception:
+            detail = "<unreadable>"
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    if "text/event-stream" in ctype:
+        return new_session, parse_sse(raw)
+    if not raw.strip():
+        return new_session, []
+    try:
+        return new_session, [json.loads(raw.decode("utf-8"))]
+    except json.JSONDecodeError:
+        raise RuntimeError(f"non-JSON response: {raw[:500]!r}")
+
+
+def rpc_result(messages, rid):
+    for m in messages:
+        if isinstance(m, dict) and m.get("id") == rid:
+            if "error" in m:
+                raise RuntimeError(f"RPC error: {json.dumps(m['error'])}")
+            return m.get("result")
+    raise RuntimeError(f"no result for request id {rid}; got: {messages!r}"[:1000])
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--params", default="read_only=true",
+                    help="query params, e.g. 'project_ref=REF&read_only=true&features=database'")
+    ap.add_argument("action", choices=["tools", "call"])
+    ap.add_argument("tool", nargs="?", help="tool name for 'call'")
+    ap.add_argument("--args", default="{}",
+                    help="JSON object of tool arguments, or @file")
+    args = ap.parse_args()
+
+    url = MCP_BASE + ("?" + args.params if args.params else "")
+
+    # 1. initialize
+    sid, msgs = mcp_post(url, None, {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "mit-agent-skills-mcp", "version": "1.0.0"},
+        },
+    })
+    init = rpc_result(msgs, 1)
+
+    # 2. initialized notification (no response expected)
+    try:
+        sid, _ = mcp_post(url, sid, {
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        })
+    except RuntimeError:
+        pass  # some servers 202 with empty body; fine
+
+    # 3. tools/list or tools/call
+    if args.action == "tools":
+        sid, msgs = mcp_post(url, sid, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
+        })
+        result = rpc_result(msgs, 2)
+        names = [t["name"] for t in result.get("tools", [])]
+        print(json.dumps(names, indent=2))
+    else:
+        raw = args.args
+        if raw.startswith("@"):
+            with open(raw[1:], "r", encoding="utf-8") as f:
+                raw = f.read()
+        tool_args = json.loads(raw)
+        sid, msgs = mcp_post(url, sid, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": args.tool, "arguments": tool_args},
+        })
+        result = rpc_result(msgs, 2)
+        print(json.dumps(result, indent=2))
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except DynamicCredentialError as e:
+        print(f"credential error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

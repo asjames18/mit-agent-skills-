@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Notion CLI: search, read pages, query databases, append/update content.
+
+Auth: uses the stored custom.notion connector via surrogate exchange.
+Usage:
+  notion search "query" [--pages-only]
+  notion read <page-id> [--max-blocks 200]
+  notion query-db <database-id> [--filter-json '{...}']
+  notion append <page-id> --text "markdown-ish text"
+  notion set-title <page-id> "New title"
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cred import add_surrogate_to_request, read_json_response
+
+HOST = "api.notion.com"
+NOTION_VERSION = "2022-06-28"
+CONNECTOR = "custom.notion"
+
+
+def api(method, path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"https://{HOST}{path}", data=data, method=method,
+        headers={"User-Agent": "mit-agent-skills/1.0",
+                 "Notion-Version": NOTION_VERSION,
+                 "Content-Type": "application/json"})
+    add_surrogate_to_request(req, CONNECTOR, allowed_hosts=(HOST,))
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+        return read_json_response(resp)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:600]
+        print(f"ERROR {e.code}: {body}", file=sys.stderr)
+        sys.exit(1)
+
+
+def rich_text(arr):
+    return "".join(x.get("plain_text", "") for x in (arr or []))
+
+
+def page_title(page):
+    props = page.get("properties", {})
+    for v in props.values():
+        if v.get("type") == "title":
+            return rich_text(v.get("title", []))
+    return page.get("id", "")
+
+
+def cmd_search(args):
+    query = args[0] if args else ""
+    payload = {"query": query, "page_size": 20}
+    if "--pages-only" in args:
+        payload["filter"] = {"property": "object", "value": "page"}
+    res = api("POST", "/v1/search", payload)
+    for r in res.get("results", []):
+        print(f"{r['object']:8} {r['id']}  {page_title(r)[:80]}")
+
+
+def get_blocks(block_id, max_blocks=200):
+    blocks, cursor = [], None
+    while len(blocks) < max_blocks:
+        path = f"/v1/blocks/{block_id}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        res = api("GET", path)
+        blocks.extend(res.get("results", []))
+        if not res.get("has_more"):
+            break
+        cursor = res.get("next_cursor")
+    return blocks[:max_blocks]
+
+
+def render_block(b, indent=0):
+    t = b.get("type")
+    pad = "  " * indent
+    if t in ("paragraph", "heading_1", "heading_2", "heading_3", "quote",
+             "callout", "bulleted_list_item", "numbered_list_item", "to_do",
+             "toggleable_heading_1", "toggleable_heading_2", "toggleable_heading_3"):
+        d = b.get(t, {})
+        text = rich_text(d.get("rich_text", []))
+        prefix = {"heading_1": "# ", "heading_2": "## ", "heading_3": "### ",
+                  "quote": "> ", "bulleted_list_item": "- ",
+                  "numbered_list_item": "1. "}.get(t, "")
+        if t == "to_do":
+            prefix = "[x] " if d.get("checked") else "[ ] "
+        lines = [f"{pad}{prefix}{text}"]
+        if b.get("has_children"):
+            for c in get_blocks(b["id"], 50):
+                lines.append(render_block(c, indent + 1))
+        return "\n".join(lines)
+    if t == "code":
+        d = b.get("code", {})
+        return f"{pad}```{d.get('language', '')}\n{rich_text(d.get('rich_text', []))}\n{pad}```"
+    if t == "divider":
+        return f"{pad}---"
+    if t == "child_page":
+        return f"{pad}[page] {b.get('child_page', {}).get('title', '')}"
+    if t == "child_database":
+        return f"{pad}[database] {b.get('child_database', {}).get('title', '')}"
+    return ""
+
+
+def cmd_read(args):
+    page_id = args[0]
+    max_blocks = 200
+    if "--max-blocks" in args:
+        max_blocks = int(args[args.index("--max-blocks") + 1])
+    page = api("GET", f"/v1/pages/{page_id}")
+    print(f"# {page_title(page)}\n")
+    for b in get_blocks(page_id, max_blocks):
+        out = render_block(b)
+        if out.strip():
+            print(out)
+
+
+def cmd_query_db(args):
+    db_id = args[0]
+    payload = {}
+    if "--filter-json" in args:
+        payload["filter"] = json.loads(args[args.index("--filter-json") + 1])
+    res = api("POST", f"/v1/databases/{db_id}/query", payload)
+    for p in res.get("results", []):
+        props = {}
+        for k, v in p.get("properties", {}).items():
+            vt = v.get("type")
+            if vt == "title":
+                props[k] = rich_text(v.get("title", []))
+            elif vt == "rich_text":
+                props[k] = rich_text(v.get("rich_text", []))
+            elif vt == "select":
+                props[k] = (v.get("select") or {}).get("name")
+            elif vt == "status":
+                props[k] = (v.get("status") or {}).get("name")
+            elif vt == "date":
+                props[k] = (v.get("date") or {}).get("start")
+        print(f"{p['id']}  {json.dumps(props, ensure_ascii=False)[:200]}")
+    if res.get("has_more"):
+        print("(more results available; re-run with filter)", file=sys.stderr)
+
+
+def cmd_append(args):
+    page_id = args[0]
+    text = args[args.index("--text") + 1] if "--text" in args else sys.stdin.read()
+    children = []
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        if para.startswith("# "):
+            children.append({"type": "heading_1",
+                             "heading_1": {"rich_text": [{"type": "text", "text": {"content": para[2:]}}]}})
+        elif para.startswith("## "):
+            children.append({"type": "heading_2",
+                             "heading_2": {"rich_text": [{"type": "text", "text": {"content": para[3:]}}]}})
+        else:
+            children.append({"type": "paragraph",
+                             "paragraph": {"rich_text": [{"type": "text", "text": {"content": para}}]}})
+    res = api("PATCH", f"/v1/blocks/{page_id}/children", {"children": children})
+    print(f"appended {len(res.get('results', []))} blocks")
+
+
+def cmd_set_title(args):
+    page_id, title = args[0], args[1]
+    page = api("GET", f"/v1/pages/{page_id}")
+    title_prop = next((k for k, v in page.get("properties", {}).items()
+                       if v.get("type") == "title"), None)
+    if not title_prop:
+        print("ERROR: no title property on page", file=sys.stderr)
+        sys.exit(1)
+    api("PATCH", f"/v1/pages/{page_id}",
+        {"properties": {title_prop: {"title": [{"type": "text", "text": {"content": title}}]}}})
+    print("title updated")
+
+
+CMDS = {"search": cmd_search, "read": cmd_read, "query-db": cmd_query_db,
+        "append": cmd_append, "set-title": cmd_set_title}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        print(__doc__.strip())
+        sys.exit(2)
+    CMDS[sys.argv[1]](sys.argv[2:])

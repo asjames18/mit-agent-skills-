@@ -10,3 +10,49 @@ skills:
       Research, evaluate, create platform-native drafts, approve, and learn
       from social content while preserving evidence, privacy, and
       exact-revision authorization.
+  - name: cloudflare
+    path: skills/cloudflare
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      Call the Cloudflare API and deploy prebuilt workers, with portable
+      credential attachment.
+  - name: elevenlabs
+    path: skills/elevenlabs
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      ElevenLabs text-to-speech CLI: list voices and synthesize speech to MP3.
+  - name: github
+    path: skills/github
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      Call the GitHub REST API with scoped, credential-brokered auth.
+  - name: notion
+    path: skills/notion
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      Notion CLI: search, read pages, query databases, append and update
+      content.
+  - name: supabase
+    path: skills/supabase
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      Supabase helpers: hosted MCP JSON-RPC client and a read-only production
+      schema dump.
+  - name: threads-post
+    path: skills/threads-post
+    version: 1.0.0
+    status: current
+    license: MIT
+    description: >-
+      Publish and reply on Threads via Meta's Threads API with an
+      approval-gated posting queue.

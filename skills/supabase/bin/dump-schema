@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Dump a live Supabase project's schema (read-only) into a baseline migration file.
+
+Reads pg_catalog via the hosted Supabase MCP server (project-scoped, read-only)
+and generates an idempotent baseline SQL migration capturing the production
+schema as it exists today.
+
+Usage:
+  dump-schema --project-ref <ref> --out /path/to/baseline.sql
+  # or set SUPABASE_PROJECT_REF env var instead of --project-ref
+
+Output: a single .sql file with CREATE EXTENSION / TYPE / TABLE / INDEX /
+RLS / POLICY / FUNCTION / TRIGGER statements, guarded for idempotent apply.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SKILL_BIN = Path(__file__).resolve().parent
+
+
+def mcp_params(project_ref):
+    return f"project_ref={project_ref}&read_only=true&features=database"
+
+_loader = importlib.machinery.SourceFileLoader("mcp_cli", f"{SKILL_BIN}/mcp-call")
+spec = importlib.util.spec_from_loader("mcp_cli", _loader)
+mcp = importlib.util.module_from_spec(spec)
+_loader.exec_module(mcp)
+
+TAG_RE = re.compile(r"<untrusted-data-[0-9a-f-]+>\s*\n(.*?)\n\s*</untrusted-data-[0-9a-f-]+>",
+                    re.DOTALL)
+
+
+def extract_rows(tool_result):
+    """Unwrap MCP execute_sql result -> list of row dicts."""
+    text = tool_result["content"][0]["text"]
+    payload = json.loads(text)
+    m = TAG_RE.search(payload["result"])
+    if not m:
+        raise RuntimeError(f"could not find data tags in: {payload['result'][:300]!r}")
+    return json.loads(m.group(1))
+
+
+class Session:
+    def __init__(self, project_ref):
+        self.url = mcp.MCP_BASE + "?" + mcp_params(project_ref)
+        self.sid = None
+        self._rid = 0
+
+    def _rpc(self, method, params):
+        self._rid += 1
+        rid = self._rid
+        self.sid, msgs = mcp.mcp_post(
+            self.url, self.sid,
+            {"jsonrpc": "2.0", "id": rid, "method": method, "params": params},
+        )
+        return mcp.rpc_result(msgs, rid)
+
+    def open(self):
+        self.sid, msgs = mcp.mcp_post(self.url, None, {
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": mcp.PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "mit-agent-skills-schema-dump", "version": "1.0.0"},
+            },
+        })
+        mcp.rpc_result(msgs, 0)
+        try:
+            self.sid, _ = mcp.mcp_post(
+                self.url, self.sid,
+                {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except RuntimeError:
+            pass
+
+    def sql(self, query):
+        res = self._rpc("tools/call",
+                        {"name": "execute_sql", "arguments": {"query": query}})
+        return extract_rows(res)
+
+
+QUERIES = {
+    "tables": """
+        SELECT c.relname AS table_name,
+               c.relrowsecurity AS rls_enabled,
+               c.relforcerowsecurity AS rls_forced
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY 1""",
+    "columns": """
+        SELECT c.relname AS table_name, a.attname AS column_name,
+               format_type(a.atttypid, a.atttypmod) AS data_type,
+               NOT a.attnotnull AS is_nullable,
+               a.attgenerated AS attgenerated,
+               pg_get_expr(d.adbin, d.adrelid) AS column_default,
+               t.typname AS udt_name
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_type t ON t.oid = a.atttypid
+        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
+          AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY 1, a.attnum""",
+    "constraints": """
+        SELECT c.relname AS table_name, co.conname AS constraint_name,
+               co.contype AS constraint_type,
+               pg_get_constraintdef(co.oid) AS definition
+        FROM pg_constraint co
+        JOIN pg_class c ON c.oid = co.conrelid
+        JOIN pg_namespace n ON n.oid = co.connamespace
+        WHERE n.nspname = 'public' AND co.contype IN ('p','f','u','c')
+        ORDER BY 1, 2""",
+    "indexes": """
+        SELECT t.relname AS table_name, ic.relname AS index_name,
+               pg_get_indexdef(ic.oid) AS indexdef,
+               EXISTS (SELECT 1 FROM pg_constraint co WHERE co.conindid = ic.oid)
+                 AS backs_constraint
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = 'public' ORDER BY 1, 2""",
+    "policies": """
+        SELECT c.relname AS table_name, pol.polname AS policy_name,
+               CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
+                    WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE'
+                    ELSE 'ALL' END AS command,
+               pol.polpermissive AS permissive,
+               (SELECT coalesce(array_agg(r.rolname), '{}')
+                FROM pg_roles r WHERE r.oid = ANY (pol.polroles)) AS roles,
+               pg_get_expr(pol.polqual, pol.polrelid) AS using_expr,
+               pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr
+        FROM pg_policy pol
+        JOIN pg_class c ON c.oid = pol.polrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' ORDER BY 1, 2""",
+    "functions": """
+        SELECT pg_get_functiondef(p.oid) AS funcdef
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' ORDER BY p.proname""",
+    "triggers": """
+        SELECT c.relname AS table_name, t.tgname AS trigger_name,
+               pg_get_triggerdef(t.oid) AS triggerdef
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND NOT t.tgisinternal ORDER BY 1, 2""",
+    "enums": """
+        SELECT t.typname AS enum_name, e.enumlabel AS label
+        FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public' ORDER BY 1, e.enumsortorder""",
+    "views": """
+        SELECT c.relname AS view_name, pg_get_viewdef(c.oid) AS viewdef
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'v' ORDER BY 1""",
+    "extensions": """
+        SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY 1""",
+    "sequences": """
+        SELECT s.relname AS sequence_name
+        FROM pg_class s JOIN pg_namespace n ON n.oid = s.relnamespace
+        WHERE n.nspname = 'public' AND s.relkind = 'S'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                          WHERE d.objid = s.oid AND d.deptype = 'a')""",
+}
+
+SERIAL_RE = re.compile(r"^nextval\('[^']+'::regclass\)$")
+
+# Catalog defaults that PostgreSQL cannot (re)create via DDL.
+# Verified live 2026-09-14: public.rooms.topic is a STORED generated column
+# (attgenerated='s') with expression
+# (('room:'::text || (id)::text) || ':messages'::text). Column references are
+# legal in generated-column expressions, so this is valid and functional in
+# production — do NOT drop it. The expression lives in pg_attrdef, so the
+# naive dump rendered it as DEFAULT (which PostgreSQL rejects). The
+# generator emits it as GENERATED ALWAYS AS (...) STORED instead.
+
+
+def quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def parse_pg_array(s):
+    """Parse a Postgres array text literal like '{admin,editor}' into a list."""
+    if s is None:
+        return []
+    if isinstance(s, list):
+        return s
+    s = s.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return [s] if s else []
+    inner = s[1:-1]
+    items, cur, in_q, esc = [], "", False, False
+    for ch in inner:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_q = not in_q
+        elif ch == "," and not in_q:
+            items.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    items.append(cur)
+    if len(items) == 1 and items[0] == "":
+        return []
+    return items
+
+
+def gen(data, project_ref):
+    L = []
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    L.append(f"-- Baseline migration: Real & Raw Gospel production schema")
+    L.append(f"-- Generated {now} from live project {project_ref} (read-only).")
+    L.append(f"-- Captures the production schema as it exists; intended as the")
+    L.append(f"-- single baseline that future migrations build on.")
+    L.append(f"-- Apply order: extensions -> types -> tables -> constraints/indexes")
+    L.append(f"--   -> functions -> RLS/policies -> triggers.")
+    L.append("")
+
+    # Extensions
+    for r in data["extensions"]:
+        L.append(f'CREATE EXTENSION IF NOT EXISTS "{r["extname"]}";')
+    if data["extensions"]:
+        L.append("")
+
+    # Enums
+    enums = {}
+    for r in data["enums"]:
+        enums.setdefault(r["enum_name"], []).append(r["label"])
+    for name, labels in enums.items():
+        lab = ", ".join("'" + l.replace("'", "''") + "'" for l in labels)
+        L.append("DO $$ BEGIN")
+        L.append(f"    CREATE TYPE public.{quote_ident(name)} AS ENUM ({lab});")
+        L.append("EXCEPTION WHEN duplicate_object THEN NULL;")
+        L.append("END $$;")
+    if enums:
+        L.append("")
+
+    # Columns grouped by table
+    cols = {}
+    for r in data["columns"]:
+        cols.setdefault(r["table_name"], []).append(r)
+
+    # Constraints grouped by table
+    cons = {}
+    for r in data["constraints"]:
+        cons.setdefault(r["table_name"], []).append(r)
+
+    fk_stmts = []
+    for t in sorted(cols):
+        L.append(f"CREATE TABLE IF NOT EXISTS public.{quote_ident(t)} (")
+        parts = []
+        for c in cols[t]:
+            dtype = c["data_type"]
+            default = c.get("column_default")
+            if dtype == "USER-DEFINED":
+                dtype = f"public.{quote_ident(c['udt_name'])}"
+            elif dtype == "integer" and default and SERIAL_RE.match(default):
+                dtype, default = "SERIAL", None
+            elif dtype == "bigint" and default and SERIAL_RE.match(default):
+                dtype, default = "BIGSERIAL", None
+            elif dtype == "smallint" and default and SERIAL_RE.match(default):
+                dtype, default = "SMALLSERIAL", None
+            col = f"    {quote_ident(c['column_name'])} {dtype}"
+            if not c["is_nullable"]:
+                col += " NOT NULL"
+            if default:
+                if c.get("attgenerated") == "s":
+                    # Stored generated column: expression lives in pg_attrdef
+                    # but must be emitted as GENERATED ALWAYS, not DEFAULT.
+                    col += f" GENERATED ALWAYS AS ({default}) STORED"
+                else:
+                    col += f" DEFAULT {default}"
+            parts.append(col)
+        for co in cons.get(t, []):
+            if co["constraint_type"] in ("p", "u", "c"):
+                parts.append(f"    CONSTRAINT {quote_ident(co['constraint_name'])} {co['definition']}")
+            elif co["constraint_type"] == "f":
+                fk_stmts.append(
+                    f"ALTER TABLE public.{quote_ident(t)} "
+                    f"DROP CONSTRAINT IF EXISTS {quote_ident(co['constraint_name'])};\n"
+                    f"ALTER TABLE public.{quote_ident(t)} "
+                    f"ADD CONSTRAINT {quote_ident(co['constraint_name'])} {co['definition']};")
+        L.append(",\n".join(parts))
+        L.append(");")
+    L.append("")
+
+    for s in fk_stmts:
+        L.append(s)
+    if fk_stmts:
+        L.append("")
+
+    # Indexes (non-constraint-backed)
+    for r in data["indexes"]:
+        if r["backs_constraint"]:
+            continue
+        idef = r["indexdef"]
+        idef = idef.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+        idef = idef.replace("CREATE UNIQUE INDEX",
+                            "CREATE UNIQUE INDEX IF NOT EXISTS", 1)
+        L.append(idef + ";")
+    L.append("")
+
+    # Views
+    for r in data["views"]:
+        L.append(f"CREATE OR REPLACE VIEW public.{quote_ident(r['view_name'])} AS")
+        L.append(r["viewdef"].rstrip().rstrip(";") + ";")
+    if data["views"]:
+        L.append("")
+
+    # RLS
+    for r in data["tables"]:
+        t = r["table_name"]
+        if r["rls_enabled"]:
+            L.append(f"ALTER TABLE public.{quote_ident(t)} ENABLE ROW LEVEL SECURITY;")
+            if r["rls_forced"]:
+                L.append(f"ALTER TABLE public.{quote_ident(t)} FORCE ROW LEVEL SECURITY;")
+    L.append("")
+
+    # Functions (must precede policies: some policies call public.has_role())
+    for r in data["functions"]:
+        L.append(r["funcdef"].rstrip().rstrip(";") + ";")
+    if data["functions"]:
+        L.append("")
+
+    # Policies
+    for r in data["policies"]:
+        t, name = r["table_name"], r["policy_name"]
+        roles = parse_pg_array(r["roles"])
+        if roles:
+            role_sql = ", ".join(
+                "public" if x == "public" else quote_ident(x) for x in roles)
+        else:
+            role_sql = "public"  # polroles = {0} means PUBLIC
+        stmt = (f"DROP POLICY IF EXISTS {quote_ident(name)} "
+                f"ON public.{quote_ident(t)};\n"
+                f"CREATE POLICY {quote_ident(name)} ON public.{quote_ident(t)}")
+        if not r["permissive"]:
+            stmt += " AS RESTRICTIVE"
+        stmt += f" FOR {r['command']} TO {role_sql}"
+        if r["using_expr"]:
+            stmt += f" USING ({r['using_expr']})"
+        if r["check_expr"]:
+            stmt += f" WITH CHECK ({r['check_expr']})"
+        L.append(stmt + ";")
+    if data["policies"]:
+        L.append("")
+
+    # Standalone sequences (non-serial-owned)
+    for r in data["sequences"]:
+        L.append(f"CREATE SEQUENCE IF NOT EXISTS "
+                 f"public.{quote_ident(r['sequence_name'])};")
+    if data["sequences"]:
+        L.append("")
+
+    # Triggers
+    for r in data["triggers"]:
+        t, name = r["table_name"], r["trigger_name"]
+        L.append(f"DROP TRIGGER IF EXISTS {quote_ident(name)} "
+                 f"ON public.{quote_ident(t)};")
+        L.append(r["triggerdef"].rstrip().rstrip(";") + ";")
+    if data["triggers"]:
+        L.append("")
+
+    return "\n".join(L)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="output .sql file path")
+    ap.add_argument("--project-ref", default=os.environ.get("SUPABASE_PROJECT_REF"),
+                    help="Supabase project ref (or set SUPABASE_PROJECT_REF)")
+    args = ap.parse_args()
+    if not args.project_ref:
+        raise SystemExit("error: provide --project-ref or set SUPABASE_PROJECT_REF")
+
+    sess = Session(args.project_ref)
+    print("opening MCP session...", file=sys.stderr)
+    sess.open()
+    data = {}
+    for name, query in QUERIES.items():
+        print(f"  dumping {name}...", file=sys.stderr)
+        data[name] = sess.sql(query)
+        print(f"    {len(data[name])} rows", file=sys.stderr)
+
+    sql = gen(data, args.project_ref)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(sql)
+    print(f"wrote {len(sql)} chars to {args.out}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
