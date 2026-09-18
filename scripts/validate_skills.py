@@ -32,12 +32,41 @@ def parse_frontmatter(text: str, skill_file: Path) -> tuple[str, str]:
     except ValueError as exc:
         raise ValueError(f"{skill_file}: unclosed YAML frontmatter") from exc
 
-    name_match = re.search(r"^name:\s*(.+?)\s*$", frontmatter, re.MULTILINE)
-    description_match = re.search(r"^description:\s*(.+?)\s*$", frontmatter, re.MULTILINE)
-    if not name_match or not description_match:
+    name = parse_yaml_scalar(frontmatter, "name")
+    description = parse_yaml_scalar(frontmatter, "description")
+    if name is None or description is None:
         raise ValueError(f"{skill_file}: frontmatter requires name and description")
 
-    return name_match.group(1).strip(" '\""), description_match.group(1).strip(" '\"")
+    return name, description
+
+
+def parse_yaml_scalar(frontmatter: str, key: str) -> str | None:
+    prefix = f"{key}:"
+    lines = frontmatter.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+
+        raw = line[len(prefix) :].strip()
+        if raw in {">", ">-", ">+", "|", "|-", "|+"}:
+            collected: list[str] = []
+            for continuation in lines[index + 1 :]:
+                if continuation.startswith((" ", "\t")):
+                    collected.append(continuation.strip())
+                elif continuation.strip() == "":
+                    collected.append("")
+                else:
+                    break
+            while collected and collected[-1] == "":
+                collected.pop()
+            if raw.startswith(">"):
+                return " ".join(part for part in collected if part)
+            return "\n".join(collected)
+
+        if raw == "":
+            return None
+        return raw.strip(" '\"")
+    return None
 
 
 def validate_skill(skill_dir: Path) -> list[str]:

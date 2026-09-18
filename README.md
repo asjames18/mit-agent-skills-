@@ -7,6 +7,7 @@ Open-source, portable workflows for AI agents doing practical work with evidence
 | Skill | Purpose | Version |
 | --- | --- | --- |
 | [`governed-social-content`](skills/governed-social-content/SKILL.md) | Research, evaluate, create platform-native drafts, approve, and learn from social content without treating preparation as permission to publish. | 0.2.0 |
+| [`tiered-technical-product-review`](skills/tiered-technical-product-review/SKILL.md) | Produce a source-backed adopt, test, defer, or reject brief for a technical product, AI tool, vendor, or implementation option without treating research as permission to act. | 0.1.0 |
 | [`cloudflare`](skills/cloudflare/SKILL.md) | Call the Cloudflare API and deploy prebuilt workers, with portable credential attachment. | 1.0.0 |
 | [`elevenlabs`](skills/elevenlabs/SKILL.md) | ElevenLabs text-to-speech CLI: list voices and synthesize speech to MP3. | 1.0.0 |
 | [`github`](skills/github/SKILL.md) | Call the GitHub REST API with scoped, credential-brokered auth. | 1.0.0 |
